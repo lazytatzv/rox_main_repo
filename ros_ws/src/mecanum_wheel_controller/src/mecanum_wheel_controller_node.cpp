@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <thread>
 #include <cmath>
+#include <chrono>
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include "mecanum_wheel_controller/ddsm_ctrl.hpp"
@@ -24,31 +25,38 @@ public:
     //　モーターのIDは事前に設定する必要あり
     this->declare_parameter("motor_ids", std::vector<int64_t>{1, 2, 3, 4});  // Motor IDs [FL, FR, BL, BR]
     
-    // Initialize DDSM controllers for each motor
-    for (int i = 0; i < 4; i++) {
-      ddsm_controllers_[i] = std::make_unique<DDSM_CTRL>();
-    }
+    // Initialize DDSM controller (single controller for all motors on same serial bus)
+    ddsm_controller_ = std::make_unique<DDSM_CTRL>();
     
     // Initialize serial connection and set motor type
     std::string port = this->get_parameter("serial_port").as_string();
     int baud = this->get_parameter("baud_rate").as_int();
     
-    bool init_success = true;
-    for (int i = 0; i < 4; i++) {
-      if (!ddsm_controllers_[i]->init(port, baud)) {
-        RCLCPP_ERROR(this->get_logger(), "Failed to initialize DDSM controller %d", i);
-        init_success = false;
-      } else {
-        // Set motor type to DDSM115 and configure speed mode
-        ddsm_controllers_[i]->set_ddsm_type(115);
+    bool init_success = false;
+    if (ddsm_controller_->init(port, baud)) {
+      // Set motor type to DDSM115
+      if (ddsm_controller_->set_ddsm_type(115) == TYPE_DDSM115) {
+        RCLCPP_INFO(this->get_logger(), "DDSM115 motor type set successfully");
         
-        // Set to speed/velocity mode (mode 2)
+        // Set all motors to velocity/speed mode (mode 2)
         auto motor_ids = this->get_parameter("motor_ids").as_integer_array();
-        if (i < motor_ids.size()) {
-          ddsm_controllers_[i]->ddsm_change_mode(motor_ids[i], 2);
-          std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Small delay between commands
+        init_success = true;
+        
+        for (size_t i = 0; i < motor_ids.size() && i < 4; i++) {
+          RCLCPP_INFO(this->get_logger(), "Setting motor ID %ld to velocity mode", motor_ids[i]);
+          ddsm_controller_->ddsm_change_mode(motor_ids[i], DDSM115_SPEED_MODE);
+          std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Delay between mode changes
         }
+        
+        // Clear any residual data in the buffer after mode changes
+        ddsm_controller_->clear_ddsm_buffer();
+        
+        RCLCPP_INFO(this->get_logger(), "All motors set to velocity mode (RPM control)");
+      } else {
+        RCLCPP_ERROR(this->get_logger(), "Failed to set motor type to DDSM115");
       }
+    } else {
+      RCLCPP_ERROR(this->get_logger(), "Failed to initialize DDSM controller on port %s", port.c_str());
     }
     
     if (init_success) {
@@ -68,7 +76,7 @@ public:
 private:
   // Member variables
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_subscription_;
-  std::unique_ptr<DDSM_CTRL> ddsm_controllers_[4]; // FL, FR, BL, BR
+  std::unique_ptr<DDSM_CTRL> ddsm_controller_; // Single controller for all motors on same serial bus
 
   void cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg)
   {
@@ -113,30 +121,40 @@ private:
   void send_motor_commands(double fl, double fr, double bl, double br) {
     auto motor_ids = this->get_parameter("motor_ids").as_integer_array();
     
-    // Convert rad/s to RPM and apply scale factor
-    // DDSM115 speed range: -330 to 330 rpm
-    const double rad_s_to_rpm = 60.0 / (2.0 * M_PI); // Convert rad/s to RPM
-    const double scale_factor = 50.0; // Adjust this based on your desired max speed
+    // Convert rad/s to RPM for DDSM115 motors
+    // DDSM115 speed range: -330 to +330 rpm
+    const double rad_s_to_rpm = 60.0 / (2.0 * M_PI); // Convert rad/s to RPM (≈9.549)
     
-    int fl_cmd = static_cast<int>(fl * rad_s_to_rpm * scale_factor);
-    int fr_cmd = static_cast<int>(fr * rad_s_to_rpm * scale_factor);
-    int bl_cmd = static_cast<int>(bl * rad_s_to_rpm * scale_factor);
-    int br_cmd = static_cast<int>(br * rad_s_to_rpm * scale_factor);
+    // Convert wheel velocities to RPM
+    int fl_rpm = static_cast<int>(fl * rad_s_to_rpm);
+    int fr_rpm = static_cast<int>(fr * rad_s_to_rpm);
+    int bl_rpm = static_cast<int>(bl * rad_s_to_rpm);
+    int br_rpm = static_cast<int>(br * rad_s_to_rpm);
     
     // Clamp commands to DDSM115 limits (-330 to 330 rpm)
-    fl_cmd = std::max(-330, std::min(330, fl_cmd));
-    fr_cmd = std::max(-330, std::min(330, fr_cmd));
-    bl_cmd = std::max(-330, std::min(330, bl_cmd));
-    br_cmd = std::max(-330, std::min(330, br_cmd));
+    fl_rpm = std::max(-330, std::min(330, fl_rpm));
+    fr_rpm = std::max(-330, std::min(330, fr_rpm));
+    bl_rpm = std::max(-330, std::min(330, bl_rpm));
+    br_rpm = std::max(-330, std::min(330, br_rpm));
+    
+    RCLCPP_INFO(this->get_logger(), 
+                "Motor RPM commands: FL=%d, FR=%d, BL=%d, BR=%d",
+                fl_rpm, fr_rpm, bl_rpm, br_rpm);
     
     try {
-      // Send commands to each motor (FL, FR, BL, BR)
-      // Third parameter is acceleration_time: 0.1ms per rpm (1 = 0.1ms per rpm)
+      // Send velocity commands to each motor in RPM
+      // acceleration_time: 1 = 0.1ms per rpm (fast acceleration)
       if (motor_ids.size() >= 4) {
-        ddsm_controllers_[0]->ddsm_ctrl(motor_ids[0], fl_cmd, 1); // Front Left
-        ddsm_controllers_[1]->ddsm_ctrl(motor_ids[1], fr_cmd, 1); // Front Right
-        ddsm_controllers_[2]->ddsm_ctrl(motor_ids[2], bl_cmd, 1); // Back Left
-        ddsm_controllers_[3]->ddsm_ctrl(motor_ids[3], br_cmd, 1); // Back Right
+        ddsm_controller_->ddsm_ctrl(motor_ids[0], fl_rpm, 1); // Front Left
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        
+        ddsm_controller_->ddsm_ctrl(motor_ids[1], fr_rpm, 1); // Front Right  
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        
+        ddsm_controller_->ddsm_ctrl(motor_ids[2], bl_rpm, 1); // Back Left
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        
+        ddsm_controller_->ddsm_ctrl(motor_ids[3], br_rpm, 1); // Back Right
       }
     } catch (const std::exception& e) {
       RCLCPP_ERROR(this->get_logger(), "Error sending motor commands: %s", e.what());
@@ -148,7 +166,8 @@ private:
     
     try {
       for (size_t i = 0; i < std::min(motor_ids.size(), static_cast<size_t>(4)); i++) {
-        ddsm_controllers_[i]->ddsm_stop(motor_ids[i]);
+        ddsm_controller_->ddsm_stop(motor_ids[i]);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5)); // Small delay between stop commands
       }
       RCLCPP_INFO(this->get_logger(), "All motors stopped");
     } catch (const std::exception& e) {

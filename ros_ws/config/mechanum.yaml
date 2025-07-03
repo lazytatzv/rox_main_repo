@@ -4,5 +4,5 @@
     wheel_base_x: 0.5
     wheel_base_y: 0.5
     serial_port: "/dev/ttyACM1"
-    baud_rate: 115200
+    baud_rate: 115200 // Fixed baud rate for communication
     motor_ids: [1, 2, 3, 4]  # FL, FR, BL, BR
